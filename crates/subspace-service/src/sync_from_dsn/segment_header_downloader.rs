@@ -3,9 +3,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::pin::pin;
 use std::sync::Arc;
+use std::time::Duration;
 use subspace_core_primitives::segments::{SegmentHeader, SegmentIndex};
 use subspace_networking::Node;
 use subspace_networking::libp2p::PeerId;
+use subspace_networking::SendRequestError;
 use subspace_networking::protocols::request_response::handlers::segment_header::{
     SegmentHeaderRequest, SegmentHeaderResponse,
 };
@@ -16,6 +18,8 @@ const SEGMENT_HEADER_NUMBER_PER_REQUEST: u64 = 1000;
 const SEGMENT_HEADER_CONSENSUS_INITIAL_NODES: usize = 20;
 /// How many distinct peers to try before giving up on downloading segment headers batches.
 const SEGMENT_HEADER_PEERS_RETRIES: u32 = 20;
+/// Timeout for individual segment header requests to prevent hanging on banned/unresponsive peers.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Helps downloader segment headers from DSN
 pub struct SegmentHeaderDownloader {
@@ -124,28 +128,46 @@ impl SegmentHeaderDownloader {
 
                 let segment_indexes = Arc::new(segment_indexes);
 
-                let segment_headers = match self
-                    .dsn_node
-                    .send_generic_request(
-                        peer_id,
-                        Vec::new(),
-                        SegmentHeaderRequest::SegmentIndexes {
-                            segment_indexes: Arc::clone(&segment_indexes),
-                        },
-                    )
-                    .await
-                {
-                    Ok(response) => response.segment_headers,
-                    Err(error) => {
-                        debug!(
-                            %peer_id,
-                            %segment_headers_batch_retry,
-                            %error,
-                            %last_known_segment_index,
-                            segment_to_download_to = %segment_to_download_to.segment_index(),
-                            "Error getting segment headers from peer",
-                        );
+                let request_fut = self.dsn_node.send_generic_request(
+                    peer_id,
+                    Vec::new(),
+                    SegmentHeaderRequest::SegmentIndexes {
+                        segment_indexes: Arc::clone(&segment_indexes),
+                    },
+                );
 
+                let request_result: Result<SegmentHeaderResponse, SendRequestError> =
+                    match tokio::time::timeout(REQUEST_TIMEOUT, request_fut).await {
+                        Ok(Ok(response)) => Ok(response),
+                        Ok(Err(error)) => {
+                            debug!(
+                                %peer_id,
+                                %segment_headers_batch_retry,
+                                %error,
+                                %last_known_segment_index,
+                                segment_to_download_to = %segment_to_download_to.segment_index(),
+                                "Error getting segment headers from peer",
+                            );
+
+                            continue 'new_peer;
+                        }
+                        Err(_elapsed) => {
+                            debug!(
+                                %peer_id,
+                                %segment_headers_batch_retry,
+                                %last_known_segment_index,
+                                segment_to_download_to = %segment_to_download_to.segment_index(),
+                                "Segment header request timed out",
+                            );
+
+                            continue 'new_peer;
+                        }
+                    };
+
+                let segment_headers = match request_result {
+                    Ok(response) => response.segment_headers,
+                    Err(_) => {
+                        // Already logged above
                         continue 'new_peer;
                     }
                 };
@@ -234,18 +256,35 @@ impl SegmentHeaderDownloader {
                     async move { !known_peer }
                 })
                 .map(|peer_id| async move {
-                    let request_result = self
-                        .dsn_node
-                        .send_generic_request(
-                            peer_id,
-                            Vec::new(),
-                            SegmentHeaderRequest::LastSegmentHeaders {
-                                // Request 2 top segment headers, accounting for situations when new
-                                // segment header was just produced and not all nodes have it
-                                limit: 2,
-                            },
-                        )
-                        .await;
+                    let request_fut = self.dsn_node.send_generic_request(
+                        peer_id,
+                        Vec::new(),
+                        SegmentHeaderRequest::LastSegmentHeaders {
+                            // Request 2 top segment headers, accounting for situations when new
+                            // segment header was just produced and not all nodes have it
+                            limit: 2,
+                        },
+                    );
+
+                    let request_result: Result<SegmentHeaderResponse, SendRequestError> =
+                        match tokio::time::timeout(REQUEST_TIMEOUT, request_fut).await {
+                            Ok(Ok(response)) => Ok(response),
+                            Ok(Err(error)) => {
+                                debug!(
+                                    %peer_id,
+                                    ?error,
+                                    "Last segment headers request failed"
+                                );
+                                return None;
+                            }
+                            Err(_elapsed) => {
+                                debug!(
+                                    %peer_id,
+                                    "Last segment headers request timed out"
+                                );
+                                return None;
+                            }
+                        };
 
                     match request_result {
                         Ok(SegmentHeaderResponse { segment_headers }) => {
@@ -269,12 +308,8 @@ impl SegmentHeaderDownloader {
 
                             Some((peer_id, segment_headers))
                         }
-                        Err(error) => {
-                            debug!(
-                                %peer_id,
-                                ?error,
-                                "Last segment headers request failed"
-                            );
+                        Err(_) => {
+                            // Already logged above
                             None
                         }
                     }
