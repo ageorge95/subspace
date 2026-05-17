@@ -19,24 +19,105 @@ use tracing_subscriber::{EnvFilter, Layer, fmt};
 #[cfg(test)]
 mod tests;
 
+/// On Windows, tracing-subscriber 0.3.20+ (RUSTSEC-2025-0055) escapes raw ESC
+/// bytes (0x1B) embedded in log message strings by sc_informant into the literal
+/// 4-character text `\x1b`. This writer strips those text-encoded escape sequences
+/// from the formatted output before writing to stderr.
+#[cfg(windows)]
+mod ansi_stripper {
+    use std::io::{self, Write};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    pub(super) struct StripAnsiWriter<W: Write> {
+        inner: W,
+    }
+
+    impl<W: Write> StripAnsiWriter<W> {
+        pub(super) fn new(inner: W) -> Self {
+            Self { inner }
+        }
+
+        /// Strip text-encoded ANSI escape sequences of the form `\x1b[...letter`
+        /// (where `\x1b` is the 4 literal bytes: backslash, x, 1, b).
+        fn strip(input: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(input.len());
+            let mut i = 0;
+            while i < input.len() {
+                // Detect the 5-byte text prefix: '\', 'x', '1', 'b', '['
+                if i + 4 < input.len()
+                    && input[i] == b'\\'
+                    && input[i + 1] == b'x'
+                    && input[i + 2] == b'1'
+                    && input[i + 3] == b'b'
+                    && input[i + 4] == b'['
+                {
+                    i += 5;
+                    // Skip parameter bytes (digits, semicolons, etc.)
+                    while i < input.len() && !input[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    // Skip the terminating letter (e.g. 'm')
+                    if i < input.len() {
+                        i += 1;
+                    }
+                } else {
+                    out.push(input[i]);
+                    i += 1;
+                }
+            }
+            out
+        }
+    }
+
+    impl<W: Write> Write for StripAnsiWriter<W> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let stripped = Self::strip(buf);
+            self.inner.write_all(&stripped)?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    pub(super) struct MakeStripAnsiWriter;
+
+    impl<'a> MakeWriter<'a> for MakeStripAnsiWriter {
+        type Writer = StripAnsiWriter<io::Stderr>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            StripAnsiWriter::new(io::stderr())
+        }
+    }
+}
+
 pub fn init_logger() {
-    // TODO: Workaround for https://github.com/tokio-rs/tracing/issues/2214, also on
-    //  Windows terminal doesn't support the same colors as bash does
-    let enable_color = if cfg!(windows) {
-        false
-    } else {
-        supports_color::on(supports_color::Stream::Stderr).is_some()
+    // On Windows we use a writer that strips text-encoded ANSI escape sequences
+    // (e.g. `\x1b[37m`) that tracing-subscriber 0.3.20+ emits when sc_informant
+    // embeds raw ESC bytes inside log message strings.
+    #[cfg(windows)]
+    let layer = fmt::layer()
+        .with_writer(ansi_stripper::MakeStripAnsiWriter)
+        .with_ansi(false)
+        .with_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        );
+
+    #[cfg(not(windows))]
+    let layer = {
+        // TODO: Workaround for https://github.com/tokio-rs/tracing/issues/2214
+        let enable_color = supports_color::on(supports_color::Stream::Stderr).is_some();
+        fmt::layer().with_ansi(enable_color).with_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
     };
 
-    let res = tracing_subscriber::registry()
-        .with(
-            fmt::layer().with_ansi(enable_color).with_filter(
-                EnvFilter::builder()
-                    .with_default_directive(LevelFilter::INFO.into())
-                    .from_env_lossy(),
-            ),
-        )
-        .try_init();
+    let res = tracing_subscriber::registry().with(layer).try_init();
 
     if let Err(e) = res {
         // In production, this might be a bug in the logging setup.
