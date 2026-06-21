@@ -125,6 +125,8 @@ pub struct NodeRunner {
     reserved_peers: HashMap<PeerId, Multiaddr>,
     /// Temporarily banned peers.
     temporary_bans: Arc<Mutex<TemporaryBans>>,
+    /// Timestamps of permanently banned peers (for eventual expiry).
+    permanent_ban_timestamps: HashMap<PeerId, Instant>,
     /// Libp2p Prometheus metrics.
     libp2p_metrics: Option<Metrics>,
     /// Subspace Prometheus metrics.
@@ -220,6 +222,7 @@ impl NodeRunner {
             connected_servers: HashSet::new(),
             reserved_peers,
             temporary_bans,
+            permanent_ban_timestamps: HashMap::new(),
             libp2p_metrics,
             metrics,
             peer_ip_addresses: HashMap::new(),
@@ -397,6 +400,8 @@ impl NodeRunner {
 
     /// Handles periodical tasks.
     async fn handle_periodical_tasks(&mut self) {
+        self.remove_expired_permanent_bans();
+
         // Log current connections.
         let network_info = self.swarm.network_info();
         let connections = network_info.connection_counters();
@@ -1545,6 +1550,24 @@ impl NodeRunner {
 
         // Immediately disconnect the peer to cancel any in-flight requests.
         let _ = self.swarm.disconnect_peer_id(peer_id);
+
+        // Remember when this permanent ban was created (for later expiry).
+        self.permanent_ban_timestamps.insert(peer_id, Instant::now());
+    }
+
+    fn remove_expired_permanent_bans(&mut self) {
+        let expiration_duration = Duration::from_secs(1 * 60 * 60); // 1h
+        let now = Instant::now();
+
+        self.permanent_ban_timestamps.retain(|peer_id, ban_time| {
+            if now - *ban_time >= expiration_duration {
+                debug!(%peer_id, "Permanent ban expired, removing block");
+                self.swarm.behaviour_mut().block_list.unblock_peer(*peer_id);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn register_event_metrics(&mut self, swarm_event: &SwarmEvent<Event>) {
