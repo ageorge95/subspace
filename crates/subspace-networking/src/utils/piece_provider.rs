@@ -26,9 +26,13 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use subspace_core_primitives::pieces::{Piece, PieceIndex};
 use tokio_stream::StreamMap;
 use tracing::{Instrument, debug, trace, warn};
+
+/// Timeout for individual piece requests to prevent hanging on banned/unresponsive peers.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Validates piece against using its commitment.
 #[async_trait]
@@ -155,25 +159,31 @@ where
         while let Some(provider_id) = get_providers_stream.next().await {
             trace!(%piece_index, key, %provider_id, "get_providers returned an item");
 
-            let Ok(PieceByIndexResponse {
+            let request_fut = request_batch.send_generic_request(
+                provider_id,
+                Vec::new(),
+                PieceByIndexRequest {
+                    piece_index,
+                    cached_pieces: Arc::default(),
+                },
+            );
+
+            let response = match tokio::time::timeout(REQUEST_TIMEOUT, request_fut).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    debug!(%piece_index, %provider_id, ?error, "Piece request failed");
+                    continue;
+                }
+                Err(_elapsed) => {
+                    debug!(%piece_index, %provider_id, "Piece request timed out");
+                    continue;
+                }
+            };
+
+            let PieceByIndexResponse {
                 piece,
                 cached_pieces: _,
-            }) = request_batch
-                .send_generic_request(
-                    provider_id,
-                    Vec::new(),
-                    PieceByIndexRequest {
-                        piece_index,
-                        cached_pieces: Arc::default(),
-                    },
-                )
-                .await
-                .inspect_err(
-                    |error| debug!(%piece_index, key, %provider_id, ?error, "Piece request failed"),
-                )
-            else {
-                continue;
-            };
+            } = response;
 
             if let Some(piece) = piece {
                 trace!(%piece_index, key, %provider_id, "Piece request succeeded");
@@ -197,22 +207,31 @@ where
         piece_index: PieceIndex,
     ) -> Option<Piece> {
         // TODO: Take advantage of `cached_pieces`
+        let request_fut = self.node.send_generic_request(
+            peer_id,
+            Vec::new(),
+            PieceByIndexRequest {
+                piece_index,
+                cached_pieces: Arc::default(),
+            },
+        );
+
+        let response = match tokio::time::timeout(REQUEST_TIMEOUT, request_fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                debug!(%peer_id, %piece_index, ?error, "Piece request failed");
+                return None;
+            }
+            Err(_elapsed) => {
+                debug!(%peer_id, %piece_index, "Piece request timed out");
+                return None;
+            }
+        };
+
         let PieceByIndexResponse {
             piece,
             cached_pieces: _,
-        } = self
-            .node
-            .send_generic_request(
-                peer_id,
-                Vec::new(),
-                PieceByIndexRequest {
-                    piece_index,
-                    cached_pieces: Arc::default(),
-                },
-            )
-            .await
-            .inspect_err(|error| debug!(%peer_id, %piece_index, ?error, "Piece request failed"))
-            .ok()?;
+        } = response;
 
         if let Some(piece) = piece {
             trace!(%peer_id, %piece_index, "Piece request succeeded");
@@ -330,25 +349,31 @@ where
         while let Some(peer_id) = get_closest_peers_stream.next().await {
             trace!(%piece_index, %peer_id, %round, "get_closest_peers returned an item");
 
-            let Ok(PieceByIndexResponse {
+            let request_fut = request_batch.send_generic_request(
+                peer_id,
+                Vec::new(),
+                PieceByIndexRequest {
+                    piece_index,
+                    cached_pieces: Arc::default(),
+                },
+            );
+
+            let response = match tokio::time::timeout(REQUEST_TIMEOUT, request_fut).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    debug!(%peer_id, %piece_index, ?error, "Piece request failed.");
+                    continue;
+                }
+                Err(_elapsed) => {
+                    debug!(%peer_id, %piece_index, "Piece request timed out.");
+                    continue;
+                }
+            };
+
+            let PieceByIndexResponse {
                 piece,
                 cached_pieces: _,
-            }) = request_batch
-                .send_generic_request(
-                    peer_id,
-                    Vec::new(),
-                    PieceByIndexRequest {
-                        piece_index,
-                        cached_pieces: Arc::default(),
-                    },
-                )
-                .await
-                .inspect_err(
-                    |error| debug!(%peer_id, %piece_index, ?key, %round, ?error, "Piece request failed."),
-                )
-            else {
-                continue;
-            };
+            } = response;
 
             if let Some(piece) = piece {
                 trace!(%peer_id, %piece_index, ?key, %round,  "Piece request succeeded.");
@@ -847,17 +872,34 @@ async fn download_cached_piece_from_peer<'a, PV>(
 where
     PV: PieceValidator,
 {
-    let result = match node
-        .send_generic_request(
-            peer_id,
-            addresses,
-            CachedPieceByIndexRequest {
-                piece_index,
-                cached_pieces: Arc::clone(&check_cached_pieces),
-            },
-        )
-        .await
-    {
+    let request_fut = node.send_generic_request(
+        peer_id,
+        addresses,
+        CachedPieceByIndexRequest {
+            piece_index,
+            cached_pieces: Arc::clone(&check_cached_pieces),
+        },
+    );
+
+    let request_result = match tokio::time::timeout(REQUEST_TIMEOUT, request_fut).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => {
+            debug!(%error, %peer_id, %piece_index, "Failed to download cached piece from peer");
+            Err(())
+        }
+        Err(_elapsed) => {
+            debug!(%peer_id, %piece_index, "Cached piece request timed out");
+            return DownloadedPieceFromPeer {
+                peer_id,
+                result: None,
+                cached_pieces,
+                not_cached_pieces,
+                permit,
+            };
+        }
+    };
+
+    let result = match request_result {
         Ok(response) => {
             let CachedPieceByIndexResponse {
                 result,
@@ -878,9 +920,8 @@ where
                 }),
             }
         }
-        Err(error) => {
-            debug!(%error, %peer_id, %piece_index, "Failed to download cached piece from peer");
-
+        Err(_) => {
+            // Error already logged above
             None
         }
     };
