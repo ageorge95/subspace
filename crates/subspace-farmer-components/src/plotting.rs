@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::simd::Simd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use subspace_core_primitives::hashes::{Blake3Hash, blake3_hash, blake3_hash_parallel};
 use subspace_core_primitives::pieces::{Piece, PieceIndex, PieceOffset, Record};
 use subspace_core_primitives::pos::PosSeed;
@@ -38,6 +38,9 @@ use thiserror::Error;
 use tracing::{debug, trace, warn};
 
 const RECONSTRUCTION_CONCURRENCY_LIMIT: usize = 1;
+
+/// Maximum time allowed for a sector download before giving up (retry will continue at the farm level).
+const SECTOR_DOWNLOAD_MAX_ELAPSED_TIME: Duration = Duration::from_mins(30);
 
 /// Information about sector that was plotted
 #[derive(Debug, Clone, Encode, Decode)]
@@ -273,6 +276,7 @@ where
         }
         // This map will be mutated, removing piece indices we have already processed
         let pieces_to_download = AsyncMutex::new(pieces_to_download);
+        let download_start = Instant::now();
 
         (|| async {
             let mut pieces_to_download = pieces_to_download.lock().await;
@@ -300,9 +304,10 @@ where
             ExponentialBuilder::default()
                 .with_min_delay(Duration::from_secs(15))
                 .with_max_delay(Duration::from_mins(10))
-                // Try until we get a valid piece
                 .without_max_times(),
         )
+        // Give up eventually (wall-clock time), retry will continue at the farm level
+        .when(|_| download_start.elapsed() < SECTOR_DOWNLOAD_MAX_ELAPSED_TIME)
         .await?;
 
         raw_sector
